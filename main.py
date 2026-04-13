@@ -143,7 +143,6 @@ def build_threshold_message(threshold_percentage, cumulative_cost, budget_usd):
             f"전체 누적 비용: {format_currency(cumulative_cost)}",
             f"예산: {format_currency(budget_usd)}",
             f"사용률: {calculate_usage_percentage(cumulative_cost, budget_usd):.1f}%",
-            f"집계 종료일: {FINAL_REPORT_DATE.isoformat()}",
         ]
     )
 
