@@ -1,0 +1,207 @@
+name: Deploy Slack Cost Alert Lambda
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/deploy-lambda.yml'
+      - 'Dockerfile'
+      - 'main.py'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: slack-cost-alert-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      LAMBDA_EXECUTION_ROLE_ARN: ${{ vars.LAMBDA_EXECUTION_ROLE_ARN }}
+      SCHEDULER_ROLE_ARN: ${{ vars.EVENTBRIDGE_SCHEDULER_ROLE_ARN }}
+      SCHEDULER_NAME: ${{ vars.SCHEDULER_NAME }}
+      SCHEDULER_END_DATE_UTC: ${{ vars.SCHEDULER_END_DATE_UTC }}
+      POST_DEPLOY_SMOKE_TEST: ${{ vars.POST_DEPLOY_SMOKE_TEST }}
+      COST_START_DATE: ${{ vars.COST_START_DATE }}
+      BUDGET_USD: ${{ vars.BUDGET_USD }}
+      IMAGE_TAG: ${{ github.sha }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            AWS_REGION
+            AWS_ACCOUNT_ID
+            AWS_ROLE_TO_ASSUME
+            ECR_REPOSITORY
+            FUNCTION_NAME
+            LAMBDA_EXECUTION_ROLE_ARN
+            SCHEDULER_ROLE_ARN
+            COST_START_DATE
+            SLACK_WEBHOOK_URL
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required for deployment."
+              exit 1
+            fi
+          done
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: github-actions-slack-cost-alert
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository exists
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" >/dev/null 2>&1 || \
+          aws ecr create-repository \
+            --repository-name "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" >/dev/null
+
+      - name: Build and push Lambda image
+        id: image
+        run: |
+          set -euo pipefail
+          image_uri="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          docker build -t "$image_uri" .
+          docker push "$image_uri"
+
+          echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update Lambda function
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        run: |
+          set -euo pipefail
+          budget_usd="${BUDGET_USD:-100}"
+
+          if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --image-uri "$IMAGE_URI" \
+              --region "$AWS_REGION" >/dev/null
+
+            aws lambda wait function-updated \
+              --function-name "$FUNCTION_NAME" \
+              --region "$AWS_REGION"
+
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --role "$LAMBDA_EXECUTION_ROLE_ARN" \
+              --timeout 30 \
+              --memory-size 256 \
+              --environment "Variables={AWS_REGION=$AWS_REGION,SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL,COST_START_DATE=$COST_START_DATE,BUDGET_USD=$budget_usd}" \
+              --region "$AWS_REGION" >/dev/null
+
+            aws lambda wait function-updated \
+              --function-name "$FUNCTION_NAME" \
+              --region "$AWS_REGION"
+          else
+            aws lambda create-function \
+              --function-name "$FUNCTION_NAME" \
+              --package-type Image \
+              --code "ImageUri=$IMAGE_URI" \
+              --role "$LAMBDA_EXECUTION_ROLE_ARN" \
+              --architectures x86_64 \
+              --timeout 30 \
+              --memory-size 256 \
+              --environment "Variables={AWS_REGION=$AWS_REGION,SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL,COST_START_DATE=$COST_START_DATE,BUDGET_USD=$budget_usd}" \
+              --region "$AWS_REGION" >/dev/null
+
+            aws lambda wait function-active \
+              --function-name "$FUNCTION_NAME" \
+              --region "$AWS_REGION"
+          fi
+
+      - name: Create or update EventBridge Scheduler
+        run: |
+          set -euo pipefail
+          schedule_name="${SCHEDULER_NAME:-${FUNCTION_NAME}-daily}"
+          schedule_end_date="${SCHEDULER_END_DATE_UTC:-2026-05-23T01:10:00Z}"
+          lambda_arn="arn:aws:lambda:$AWS_REGION:$AWS_ACCOUNT_ID:function:$FUNCTION_NAME"
+          target="Arn=$lambda_arn,RoleArn=$SCHEDULER_ROLE_ARN"
+
+          if aws scheduler get-schedule --name "$schedule_name" --region "$AWS_REGION" >/dev/null 2>&1; then
+            aws scheduler update-schedule \
+              --name "$schedule_name" \
+              --description "Daily 10:00 KST deployment-managed Slack cost alert" \
+              --schedule-expression "cron(0 10 * * ? *)" \
+              --schedule-expression-timezone "Asia/Seoul" \
+              --flexible-time-window '{"Mode":"OFF"}' \
+              --target "$target" \
+              --state ENABLED \
+              --end-date "$schedule_end_date" \
+              --action-after-completion DELETE \
+              --region "$AWS_REGION" >/dev/null
+          else
+            aws scheduler create-schedule \
+              --name "$schedule_name" \
+              --description "Daily 10:00 KST deployment-managed Slack cost alert" \
+              --schedule-expression "cron(0 10 * * ? *)" \
+              --schedule-expression-timezone "Asia/Seoul" \
+              --flexible-time-window '{"Mode":"OFF"}' \
+              --target "$target" \
+              --state ENABLED \
+              --end-date "$schedule_end_date" \
+              --action-after-completion DELETE \
+              --region "$AWS_REGION" >/dev/null
+          fi
+
+      - name: Smoke test Lambda invocation
+        if: ${{ env.POST_DEPLOY_SMOKE_TEST == 'true' }}
+        run: |
+          set -euo pipefail
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --region "$AWS_REGION" \
+            response.json >/dev/null
+          cat response.json
