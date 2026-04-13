@@ -139,7 +139,7 @@ jobs:
               --role "$LAMBDA_EXECUTION_ROLE_ARN" \
               --timeout 30 \
               --memory-size 256 \
-              --environment "Variables={AWS_REGION=$AWS_REGION,SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL,COST_START_DATE=$COST_START_DATE,BUDGET_USD=$budget_usd}" \
+              --environment "Variables={SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL,COST_START_DATE=$COST_START_DATE,BUDGET_USD=$budget_usd}" \
               --region "$AWS_REGION" >/dev/null
 
             aws lambda wait function-updated \
@@ -154,7 +154,7 @@ jobs:
               --architectures x86_64 \
               --timeout 30 \
               --memory-size 256 \
-              --environment "Variables={AWS_REGION=$AWS_REGION,SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL,COST_START_DATE=$COST_START_DATE,BUDGET_USD=$budget_usd}" \
+              --environment "Variables={SLACK_WEBHOOK_URL=$SLACK_WEBHOOK_URL,COST_START_DATE=$COST_START_DATE,BUDGET_USD=$budget_usd}" \
               --region "$AWS_REGION" >/dev/null
 
             aws lambda wait function-active \
