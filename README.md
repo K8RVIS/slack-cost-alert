@@ -1,4 +1,4 @@
-# slack-cost-alart
+# slack-cost-alert
 
 - Slack Webhook으로 AWS 누적 비용을 보내는 Lambda
 - 매일 KST 오전 10시 일일 비용과 누적 비용 전송
